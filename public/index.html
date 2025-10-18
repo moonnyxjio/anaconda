@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Advanced English Analyzer — Single Page</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+  <style>
+    body { font-family: Inter, "Noto Sans KR", sans-serif; }
+    .highlight { border-radius: 0.25rem; padding: 0.05rem 0.25rem; position: relative; }
+    .highlight-tooltip { display:none; position:absolute; bottom:120%; left:50%; transform:translateX(-50%); background:#111827; color:white; padding:6px 8px; border-radius:6px; font-size:13px; white-space:nowrap; z-index:50; }
+    .highlight:hover .highlight-tooltip{ display:block; }
+    .phrase-box { display:inline-block; border-radius:6px; padding:0.15rem 0.3rem; margin:0 0.12rem; }
+    .loader { border:4px solid #f3f3f3; border-top:4px solid #4f46e5; border-radius:50%; width:36px; height:36px; animation:spin 1s linear infinite; }
+    @keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
+  </style>
+</head>
+<body class="bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 transition-colors">
+  <div class="max-w-6xl mx-auto p-6">
+    <header class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl font-bold">Advanced English Analyzer</h1>
+      <div class="flex items-center gap-3">
+        <button id="shareBtn" class="bg-blue-600 text-white px-3 py-2 rounded-lg text-sm"><i class="fa fa-share"></i> 공유 생성</button>
+        <button id="pdfBtn" class="bg-green-600 text-white px-3 py-2 rounded-lg text-sm"><i class="fa fa-file-pdf"></i> PDF</button>
+        <button id="themeToggle" class="p-2 rounded-full bg-gray-200 dark:bg-gray-700"><i id="themeIcon" class="fa fa-moon"></i></button>
+      </div>
+    </header>
+
+    <section class="mb-6">
+      <textarea id="textInput" placeholder="분석할 영어 지문을 붙여넣으세요..." class="w-full min-h-[160px] p-4 rounded-lg border bg-white dark:bg-gray-800 dark:border-gray-700"></textarea>
+      <div class="flex gap-3 mt-3">
+        <button id="analyzeBtn" class="bg-indigo-600 text-white px-4 py-2 rounded-lg">분석하기</button>
+        <button id="clearBtn" class="bg-gray-200 dark:bg-gray-700 px-4 py-2 rounded-lg">지우기</button>
+        <div id="status" class="ml-auto text-sm text-gray-500 flex items-center gap-2 hidden"><div class="loader"></div><span id="statusText">분석중...</span></div>
+      </div>
+    </section>
+
+    <main id="results" class="space-y-6">
+      <!-- results injected here -->
+    </main>
+  </div>
+
+  <script>
+  // -------------------------
+  // Helper: safe JSON extractor
+  function extractJsonFromText(text) {
+    if (!text || typeof text !== 'string') return null;
+    const jsonFence = text.match(/```json\s*([\s\S]*?)\s*```/i);
+    if (jsonFence) { try { return JSON.parse(jsonFence[1]); } catch(e){} }
+    const fence = text.match(/```([\s\S]*?)```/);
+    if (fence) { try { return JSON.parse(fence[1]); } catch(e){} }
+    try { return JSON.parse(text); } catch(e){}
+    return null;
+  }
+
+  // -------------------------
+  // DOM refs
+  const analyzeBtn = document.getElementById('analyzeBtn');
+  const textInput = document.getElementById('textInput');
+  const results = document.getElementById('results');
+  const statusEl = document.getElementById('status');
+  const statusText = document.getElementById('statusText');
+  const pdfBtn = document.getElementById('pdfBtn');
+  const shareBtn = document.getElementById('shareBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const themeToggle = document.getElementById('themeToggle');
+  const themeIcon = document.getElementById('themeIcon');
+
+  let lastAnalysis = null; // store latest analysis for share/pdf
+
+  // -------------------------
+  // UTIL: show status
+  function showStatus(show, text='분석중...') {
+    if (show) { statusEl.classList.remove('hidden'); statusText.textContent = text; }
+    else statusEl.classList.add('hidden');
+  }
+
+  // -------------------------
+  // Render helpers
+  function renderTokenSpan(token) {
+    // token: { text, pos, role, explanation_ko, phrase_starts, phrase_ends }
+    const span = document.createElement('span');
+    span.className = 'highlight';
+    // color by pos
+    const pos = (token.pos || 'DEFAULT').toUpperCase();
+    const colorMap = {
+      'NOUN':'bg-blue-100 text-blue-800',
+      'VERB':'bg-red-100 text-red-800',
+      'ADJECTIVE':'bg-green-100 text-green-800',
+      'ADVERB':'bg-yellow-100 text-yellow-800',
+      'PRONOUN':'bg-sky-100 text-sky-800',
+      'PREPOSITION':'bg-purple-100 text-purple-800',
+      'CONJUNCTION':'bg-pink-100 text-pink-800',
+      'DETERMINER':'bg-indigo-100 text-indigo-800',
+      'DEFAULT':'bg-gray-100 text-gray-800'
+    };
+    const cls = colorMap[pos] || colorMap.DEFAULT;
+    span.classList.add(...cls.split(' '));
+    span.style.margin = '0 .15rem';
+    span.style.padding = '0.05rem .25rem';
+    span.textContent = token.text;
+
+    const tip = document.createElement('div');
+    tip.className = 'highlight-tooltip';
+    tip.innerHTML = `<strong>${token.role || token.pos || ''}</strong><div style="font-size:12px;margin-top:4px;">${token.explanation_ko || ''}</div>`;
+    span.appendChild(tip);
+    return span;
+  }
+
+  function renderPhrasesAsBoxes(tokens) {
+    // render tokens with simple boxes for NP/VP/PP using phrase_starts/ends markers
+    const container = document.createElement('div');
+    container.className = 'leading-relaxed';
+    // We'll create spans and wrap phrases. Simple stack approach.
+    let idx = 0;
+    const stack = [];
+    while (idx < tokens.length) {
+      const t = tokens[idx];
+      // if phrase_starts includes something -> open a colored box
+      const starts = t.phrase_starts || [];
+      if (starts.length) {
+        // begin wrapper
+        const box = document.createElement('span');
+        const type = starts[0]; // NP, VP, PP
+        const colorBy = { NP:'bg-blue-50 border-blue-300', VP:'bg-red-50 border-red-300', PP:'bg-purple-50 border-purple-300' };
+        box.className = 'phrase-box ' + (colorBy[type] || 'bg-gray-50 border-gray-200');
+        box.style.border = '1px solid';
+        box.style.padding = '.08rem .28rem';
+        // append current token inside
+        box.appendChild(renderTokenSpan(t));
+        // consume following tokens until phrase_ends contains same type (naive)
+        let j = idx+1;
+        for (; j < tokens.length; j++) {
+          const tj = tokens[j];
+          box.appendChild(document.createTextNode(' '));
+          box.appendChild(renderTokenSpan(tj));
+          if ((tj.phrase_ends || []).includes(type)) { break; }
+        }
+        idx = j+1;
+        container.appendChild(box);
+        container.appendChild(document.createTextNode(' '));
+      } else {
+        container.appendChild(renderTokenSpan(t));
+        container.appendChild(document.createTextNode(' '));
+        idx++;
+      }
+    }
+    return container;
+  }
+
+  function renderSentenceAnalysis(item, idx) {
+    // item: analysis object for one sentence
+    const card = document.createElement('div');
+    card.className = 'p-4 bg-white dark:bg-gray-800 rounded-lg shadow';
+    const header = document.createElement('div');
+    header.className = 'flex items-start justify-between mb-3';
+    header.innerHTML = `<div><h3 class="font-semibold">문장 ${idx+1}</h3><div class="text-sm text-gray-500 dark:text-gray-400 mt-1">${item.sentenceText}</div></div>`;
+    card.appendChild(header);
+
+    // tokens/phrase visual
+    const tokens = item.tokens || [];
+    const phraseVis = renderPhrasesAsBoxes(tokens);
+    card.appendChild(phraseVis);
+
+    // chunk translations
+    if (item.chunk_translation && item.chunk_translation.length) {
+      const ct = document.createElement('div');
+      ct.className = 'mt-3 text-sm';
+      ct.innerHTML = `<strong>청크별 해석:</strong> ${item.chunk_translation.map(c=>`<div style="margin-top:.2rem"><span class="font-semibold">${c.chunk}</span> : ${c.translation}</div>`).join('')}`;
+      card.appendChild(ct);
+    }
+    // full translation, paraphrase
+    if (item.full_translation) {
+      const ft = document.createElement('div');
+      ft.className = 'mt-2 text-sm text-gray-600 dark:text-gray-300';
+      ft.innerHTML = `<strong>전체 해석:</strong><div style="margin-top:.25rem">${item.full_translation}</div>`;
+      card.appendChild(ft);
+    }
+    if (item.paraphrasing) {
+      const p = document.createElement('div');
+      p.className = 'mt-2 text-sm italic text-gray-600 dark:text-gray-300';
+      p.innerHTML = `<strong>패러프레이징: </strong>${item.paraphrasing}`;
+      card.appendChild(p);
+    }
+    // exam analysis grammar points
+    if (item.exam_analysis) {
+      const ex = document.createElement('div');
+      ex.className = 'mt-3 grid grid-cols-1 md:grid-cols-2 gap-3';
+      // grammar
+      const gp = (item.exam_analysis.grammar_points||[]);
+      const qp = (item.exam_analysis.question_predictions||[]);
+      ex.innerHTML = `<div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded"><strong>문법 포인트</strong><ul class="mt-2 text-sm">${gp.map(g=>`<li>• <strong>${g.point}</strong> — ${g.explanation}</li>`).join('')}</ul></div>
+                      <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded"><strong>예상 문제 유형</strong><ul class="mt-2 text-sm">${qp.map(q=>`<li>• <strong>${q.type}</strong> — ${q.reason}</li>`).join('')}</ul></div>`;
+      card.appendChild(ex);
+    }
+
+    // five-format and modern grammar
+    if (item.five_format_analysis) {
+      const f = item.five_format_analysis;
+      const box = document.createElement('div');
+      box.className = 'mt-3 p-3 bg-gray-50 dark:bg-gray-700/50 rounded text-sm';
+      box.innerHTML = `<strong>5형식 구조</strong>
+        <div style="margin-top:.4rem">S: ${f.subject || '-'} / V: ${f.verb || '-'} / O: ${f.object || '-'} / C: ${f.complement || '-'}</div>
+        <div class="text-xs text-gray-500 mt-2">${f.explanation || ''}</div>`;
+      card.appendChild(box);
+    }
+    if (item.modern_grammar_analysis) {
+      const mg = item.modern_grammar_analysis;
+      const box = document.createElement('div');
+      box.className = 'mt-3 p-3 bg-gray-50 dark:bg-gray-700/50 rounded text-sm';
+      box.innerHTML = `<strong>현대 문법(요약)</strong><div class="text-sm mt-2">${mg.summary || ''}</div>
+        ${(mg.clauses||[]).map(c=>`<div class="mt-2 text-sm border-l pl-3"><strong>${c.clause_type}</strong>: ${c.clause_text}<div class="text-xs text-gray-500 mt-1">${c.analysis}</div></div>`).join('')}`;
+      card.appendChild(box);
+    }
+
+    // vocabulary table
+    if (item.vocabulary && item.vocabulary.length) {
+      const tv = document.createElement('div');
+      tv.className = 'mt-3 overflow-x-auto';
+      tv.innerHTML = `<table class="w-full text-sm"><thead class="text-xs text-gray-500"><tr><th>단어</th><th>의미</th><th>동의어</th><th>반의어</th></tr></thead>
+        <tbody>${item.vocabulary.map(v=>`<tr class="border-t"><td class="py-1">${v.word}</td><td>${v.meaning||'-'}</td><td>${v.synonyms||'-'}</td><td>${v.antonyms||'-'}</td></tr>`).join('')}</tbody></table>`;
+      card.appendChild(tv);
+    }
+
+    return card;
+  }
+
+  function renderOverall(overall, final) {
+    const card = document.createElement('div');
+    card.className = 'p-4 bg-white dark:bg-gray-800 rounded-lg shadow';
+    card.innerHTML = `<h2 class="font-bold text-lg mb-3">지문 종합 분석</h2>
+      <div class="grid md:grid-cols-3 gap-4">
+        <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded"><strong>주제</strong><div class="mt-2 text-sm">${overall.topic||'-'}</div></div>
+        <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded"><strong>요지</strong><div class="mt-2 text-sm">${overall.main_idea||'-'}</div></div>
+        <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded"><strong>주장</strong><div class="mt-2 text-sm">${overall.argument||'-'}</div></div>
+      </div>
+      <div class="mt-4"><h3 class="font-semibold">수사법 분석</h3>${(overall.rhetoric||[]).map(r=>`<div class="mt-2 text-sm">• <strong>${r.device}</strong> — ${r.explanation}</div>`).join('')}</div>
+      <div class="mt-4"><h3 class="font-semibold">글의 구조도</h3><div class="mt-2 text-sm">${(overall.structure||[]).map((p,i)=>`<div class="p-2 bg-gray-50 dark:bg-gray-700/50 rounded mb-2">${i+1}. <strong>${p.part||p.role}</strong> — ${p.summary}</div>`).join('')}</div>
+      </div>`;
+
+    // final exam points
+    const finalBox = document.createElement('div');
+    finalBox.className = 'mt-4 p-3 bg-indigo-50 dark:bg-gray-800/60 rounded';
+    finalBox.innerHTML = `<h3 class="font-semibold">지문 종합 출제 포인트 및 풀이 전략</h3>
+      <div class="grid md:grid-cols-2 gap-3 mt-2">
+        <div><strong>핵심 어법</strong><ul class="mt-1 text-sm">${(final.grammar_points||[]).map(g=>`<li>• ${g.point} — <em>${g.example||''}</em></li>`).join('')}</ul></div>
+        <div><strong>핵심 어휘</strong><ul class="mt-1 text-sm">${(final.vocabulary_points||[]).map(v=>`<li>• ${v.word} — ${v.reason}</li>`).join('')}</ul></div>
+        <div class="md:col-span-2 mt-2"><strong>지칭</strong><ul class="mt-1 text-sm">${(final.reference_points||[]).map(r=>`<li>• ${r.pronoun} → ${r.refers_to}</li>`).join('')}</ul></div>
+        <div class="md:col-span-2 mt-2"><strong>요약</strong><div class="mt-1 text-sm">${final.summary_point||''}</div></div>
+        <div class="md:col-span-2 mt-2"><strong>순서 문제 풀이 힌트</strong><ul class="mt-1 text-sm">${(final.sequencing_hints||[]).map(s=>`<li>• ${s.hint} — ${s.explanation}</li>`).join('')}</ul></div>
+      </div>`;
+    card.appendChild(finalBox);
+    return card;
+  }
+
+  // -------------------------
+  // Main: call server analyze
+  async function analyzeText() {
+    const text = textInput.value.trim();
+    if (!text) return alert('분석할 영어 지문을 입력하세요.');
+    analyzeBtn.disabled = true;
+    showStatus(true,'분석 요청 중...');
+
+    try {
+      const resp = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ text })
+      });
+      if (!resp.ok) {
+        // fallback to local analyze
+        console.warn('Server analysis failed, using local fallback');
+        const textRes = await resp.text().catch(()=>null);
+        console.error('Server error:', resp.status, textRes);
+        const local = await localFallbackAnalyze(text);
+        lastAnalysis = local;
+        renderAll(local);
+        showStatus(false);
+        analyzeBtn.disabled = false;
+        return;
+      }
+      const data = await resp.json();
+      // server expected to return normalized object: { sentenceAnalyses: [...], overallAnalysis: {...}, finalAnalysis: {...}, highlights: [...] }
+      lastAnalysis = data;
+      renderAll(data);
+    } catch (e) {
+      console.error('Analyze request error', e);
+      const local = await localFallbackAnalyze(text);
+      lastAnalysis = local;
+      renderAll(local);
+    } finally {
+      showStatus(false);
+      analyzeBtn.disabled = false;
+    }
+  }
+
+  // -------------------------
+  // Render full analysis
+  function renderAll(data) {
+    results.innerHTML = '';
+    if (!data) return;
+    const sa = data.sentenceAnalyses || data.sentenceAnalyses || [];
+    sa.forEach((s,i)=> results.appendChild(renderSentenceAnalysis(s,i)));
+    if (data.overallAnalysis && data.finalAnalysis) {
+      results.appendChild(renderOverall(data.overallAnalysis, data.finalAnalysis));
+    }
+    // final highlight of original text with exam-type color marking
+    if (data.highlights && data.highlights.length) {
+      const box = document.createElement('div');
+      box.className = 'p-4 bg-white dark:bg-gray-800 rounded-lg shadow';
+      box.innerHTML = `<h3 class="font-semibold mb-2">시험 핵심 하이라이트(문항 유형별)</h3>`;
+      const textDiv = document.createElement('div');
+      textDiv.className = 'whitespace-pre-wrap text-lg leading-relaxed p-3 bg-gray-50 dark:bg-gray-700/40 rounded';
+      // safe highlight: assemble by indices to avoid HTML injection (server should return exact substrings and offsets ideally)
+      let t = data.fullText || '';
+      // naive replace for display (server-provided highlights are expected to be substrings)
+      let html = t;
+      const colorClass = {
+        'grammar':'bg-green-200',
+        'vocabulary':'bg-yellow-200',
+        'blank':'bg-sky-200',
+        'insertion':'bg-pink-200',
+        'reference':'bg-violet-200',
+        'sequence':'underline'
+      };
+      // sort by length desc to reduce nested replacement issues
+      const sorted = data.highlights.slice().sort((a,b)=>b.text.length-a.text.length);
+      sorted.forEach(h=>{
+        const cls = colorClass[h.type] || 'bg-gray-200';
+        const safe = h.text.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        html = html.split(h.text).join(`<span class="${cls}" style="padding:0.05rem .25rem;border-radius:4px">${safe}</span>`);
+      });
+      textDiv.innerHTML = html;
+      box.appendChild(textDiv);
+      results.appendChild(box);
+    }
+  }
+
+  // -------------------------
+  // Local fallback analyzer (very small rule-based to allow UI display if server fails)
+  async function localFallbackAnalyze(fullText) {
+    const sentences = fullText.match(/[^.?!]+[.?!]+/g) || [fullText];
+    const sentenceAnalyses = sentences.map(s => {
+      // create tokens
+      const words = s.trim().split(/\s+/).map(w=>w.replace(/^[^\w']+|[^\w']+$/g,''));
+      const tokens = words.map(w => {
+        const lower = w.toLowerCase();
+        const pos = (/[.,?!]/.test(w)) ? 'PUNCT' : (lower.match(/(ing|ed|s)$/) ? 'VERB' : (lower.match(/^(a|the|an)$/) ? 'DETERMINER' : (lower.match(/^(he|she|it|they|we|i|you|me|him|her)$/) ? 'PRONOUN' : 'NOUN')));
+        return { text: w, pos, role: pos==='VERB' ? '서술어 후보' : pos==='PRONOUN' ? '지칭' : '수식/명사', explanation_ko: `${w} — 품사 추정: ${pos}`, phrase_starts: pos==='VERB' ? ['VP'] : pos==='PRONOUN' ? ['NP'] : [], phrase_ends: pos==='VERB' ? ['VP'] : [] };
+      });
+      return {
+        sentenceText: s.trim(),
+        tokens,
+        chunk_translation: words.map(w=>({chunk:w, translation:'(임시) '+w})),
+        full_translation: '(임시) ' + s.trim(),
+        paraphrasing: '(임시 paraphrase) ' + s.trim(),
+        vocabulary: words.slice(0,8).map(w=>({word:w, meaning:'-', synonyms:'-', antonyms:'-'})),
+        exam_analysis: { grammar_points: [{point:'기본 문법 포인트', explanation:'로컬 추정'}], question_predictions: [{type:'빈칸', reason:'빈칸 예상'}] },
+        five_format_analysis: { subject: tokens[0]?.text||'-', verb: tokens.find(t=>t.pos==='VERB')?.text||'-', object: '-', explanation: '로컬 5형식 추정' },
+        modern_grammar_analysis: { summary:'로컬 문법 분해', clauses: [{clause_text:s.trim(), clause_type:'main', analysis:'local'}] }
+      };
+    });
+
+    const overallAnalysis = { topic:'(임시 주제)', main_idea:'(임시 요지)', argument:'(임시 주장)', rhetoric:[{device:'예시 수사법', explanation:'임시'}], structure: sentences.map((s,i)=>({part:`Part ${i+1}`, summary: s.trim().slice(0,80), role:`role ${i+1}`})) };
+    const finalAnalysis = { grammar_points: [{point:'임시 포인트', example:'e.g.'}], vocabulary_points: [], reference_points: [], summary_point:'(임시) 전체 요약', implication_points: [], sequencing_hints: [{hint:'연결어', explanation:'연결 단서 설명'}] };
+
+    const highlights = []; // empty for fallback
+    return { sentenceAnalyses, overallAnalysis, finalAnalysis, highlights, fullText };
+  }
+
+  // -------------------------
+  // share (POST /api/share returns { id: 'abcd' })
+  async function createShare() {
+    if (!lastAnalysis) return alert('먼저 분석을 실행하세요.');
+    const resp = await fetch('/api/share', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(lastAnalysis)
+    });
+    if (!resp.ok) return alert('공유 생성 실패');
+    const j = await resp.json();
+    const url = `${location.origin}${location.pathname}#id=${j.id}`;
+    await navigator.clipboard.writeText(url).catch(()=>{});
+    alert('공유 링크가 클립보드에 복사되었습니다:\n' + url);
+  }
+
+  // -------------------------
+  // PDF
+  function exportPDF() {
+    if (!lastAnalysis) return alert('먼저 분석을 완료하세요.');
+    const opt = { margin:10, filename:'analysis_report.pdf', html2canvas:{scale:2,useCORS:true}, jsPDF:{unit:'mm',format:'a4',orientation:'portrait'} };
+    html2pdf().set(opt).from(document.getElementById('results')).save();
+  }
+
+  // -------------------------
+  // load shared result by id (if present)
+  async function loadSharedIfAny() {
+    const hash = location.hash || '';
+    const m = hash.match(/id=(\w+)/);
+    if (m) {
+      const id = m[1];
+      showStatus(true,'공유된 분석 로딩 중...');
+      try {
+        const resp = await fetch('/api/share/' + id);
+        if (!resp.ok) throw new Error('Not found');
+        const data = await resp.json();
+        lastAnalysis = data;
+        renderAll(data);
+      } catch (e) {
+        alert('공유 결과를 불러오지 못했습니다.');
+      } finally { showStatus(false); }
+    }
+  }
+
+  // -------------------------
+  // UI wiring
+  analyzeBtn.addEventListener('click', analyzeText);
+  pdfBtn.addEventListener('click', exportPDF);
+  shareBtn.addEventListener('click', createShare);
+  clearBtn.addEventListener('click', ()=>{ textInput.value=''; results.innerHTML=''; lastAnalysis=null; });
+  themeToggle.addEventListener('click', ()=>{ document.documentElement.classList.toggle('dark'); themeIcon.classList.toggle('fa-moon'); themeIcon.classList.toggle('fa-sun'); });
+
+  // init
+  loadSharedIfAny();
+  </script>
+</body>
+</html>
